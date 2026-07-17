@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 rand = "0.10"
+clap = {version = "4.6", features = ["derive"]}
+bincode = "1.3"
+once_cell = "1.21"
 
 [lib]
 path = "src/lib.rs"

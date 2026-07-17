@@ -1,40 +1,70 @@
-use crate::error::{QuoteError, ParsedFieldError};
+use std::ops::Sub;
+use clap::Command;
+use std::net::IpAddr;
+use std::str::FromStr;
 
+use crate::{error::{CommandError, QuoteError}, tickers::check_tickers};
 
+const STREAM_COMMAND:&str = "STREAM {} {}";
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct StockQuote{
-    pub ticker: String,
-    pub price: f64,
-    pub volume:u32,
-    pub timestamp: u64
+pub const STREAM: &str = "STREAM";
+pub const PING: &str = "PING";
+pub const PONG: &str ="PONG";
+pub const STOP: &str = "STOP";
+
+pub struct Subscribe{
+    address: String,
+    tickers: Vec<String>
 }
 
-impl StockQuote {
-    pub fn new(ticker: String, price:f64, volume: u32, timestamp: u64) ->Self {
-        Self { ticker, price, volume, timestamp }
+impl Subscribe {
+    pub fn new(address:String, tickers :Vec<String>) -> Self{
+        Self{address, tickers}
     }
 
-    fn to_wire_line(&self) -> String {
-        format!("{}|{}|{}|{}\n", self.ticker,self.price,self.volume, self.timestamp)
-    }
 
-    // разбор полезной нагрузки без "\n"
-    fn from_wire_line(line: &str) -> Result<Self, QuoteError>{
-        let parts:Vec<&str> = line.trim().split('|').collect();
-        if parts.len() != 4{
-            return Err(QuoteError::InvalidFormat("Количество блоков больше или меньше 4".into()));
+}
+
+pub fn check_command(command: &str) -> Result<Subscribe, CommandError>{
+    if command.starts_with(STREAM){
+        let command_parts: Vec<&str> = command.splitn(3, " ").collect();
+        let address = command_parts[1];
+        match check_address(address){
+            Err(e) => return Err(e),
+            _=>{
+                let req_tickers : Vec<&str> = command_parts[2].trim().split(" ").collect();
+                if req_tickers.is_empty() {
+                    return Err(CommandError::EmptyTickerList)
+                }
+
+                match check_tickers(req_tickers){
+                    Err(e) => return Err(e),
+                    Ok(tickers) => {
+                        Ok(Subscribe::new(address.to_string(), tickers))
+                    }
+                }
+            }
         }
-
-        if parts[0].contains(" "){
-            return Err(QuoteError::InvalidTicker("Котировка содержит пробелы!".into()));
-        }
-
-        Ok(StockQuote {
-            ticker: parts[0].to_string(),
-            price: parts[1].parse::<f64>().map_err(|e| QuoteError::ParseError(ParsedFieldError{value: parts[1].to_string(), index:1, reason: Box::new(e)}))?,
-            volume: parts[2].parse::<u32>().map_err(|e| QuoteError::ParseError(ParsedFieldError{value: parts[2].to_string(), index:2, reason: Box::new(e)}))?,
-            timestamp: parts[3].parse::<u64>().map_err(|e| QuoteError::ParseError(ParsedFieldError{value: parts[3].to_string(), index:3, reason: Box::new(e)}))?
-        })
     }
+    else{
+        Err(CommandError::InvalidCommand(command.to_string()))
+    }
+}
+
+fn check_address(input: &str)-> Result<(), CommandError>{
+    if let Some(pos) = input.rfind(':') {
+        let (host_part, port_part) = input.split_at(pos);
+        
+        let host = &host_part[..pos];
+        let port_str = &port_part[1..]; 
+
+        // 1. Валидируем порт
+        if port_str.parse::<u16>().is_ok(){
+            match IpAddr::from_str(host) {
+                Ok(_) => return Ok(()),
+                Err(_) => return Err(CommandError::InvalidAddress(input.to_string()))
+            }
+        }
+    }
+    Err(CommandError::InvalidAddress(input.to_string()))
 }
