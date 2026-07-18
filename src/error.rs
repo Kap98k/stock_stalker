@@ -1,6 +1,5 @@
 use std::fmt;
 use std::error::Error;
-use std::num::{ParseFloatError, ParseIntError};
 
 #[derive(Debug)]
 pub struct ParsedFieldError{
@@ -34,6 +33,7 @@ pub enum CommandError{
     InvalidCommand(String),
     TickerNotFound(String),
     InvalidAddress(String),
+    AddressNotFound(String),
     EmptyTickerList,
 }
 
@@ -43,7 +43,8 @@ impl CommandError{
             CommandError::TickerNotFound(ticker) => format!("ERR unknown ticker: {}\n", ticker),
             CommandError::InvalidCommand(err) => format!("ERR invalid command\n"),
             CommandError::EmptyTickerList => format!("ERR empty ticker list\n"),
-            CommandError::InvalidAddress(err ) => format!("ERR invalid udp address\n")
+            CommandError::InvalidAddress(err ) => format!("ERR invalid udp address\n"),
+            CommandError::AddressNotFound(err) => format!("ERR udp address not found\n")
         }
     }
 }
@@ -54,7 +55,8 @@ impl fmt::Display for CommandError{
             CommandError::TickerNotFound(ticker) => write!(f,"Запрашиваемый тикер {} не найден!", ticker),
             CommandError::InvalidCommand(err) => write!(f, "Неверный формат команды: {}", err),
             CommandError::EmptyTickerList => write!{f, "Пустой список котировок!"},
-            CommandError::InvalidAddress(err ) => write!{f, "Неверный адрес {} для отправки котировки !", err}
+            CommandError::InvalidAddress(err ) => write!{f, "Неверный адрес {} для отправки котировки !", err},
+            CommandError::AddressNotFound(err) => write!{f, "UDP поток для адреса {} не найден!", err}
         }
     }
 }

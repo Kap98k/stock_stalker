@@ -1,11 +1,10 @@
-use std::ops::Sub;
-use clap::Command;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::{error::{CommandError, QuoteError}, tickers::check_tickers};
+use crate::{error::{CommandError}, tickers::check_tickers};
 
-const STREAM_COMMAND:&str = "STREAM {} {}";
+pub const STREAM_COMMAND:&str = "STREAM {} {}\n";
+pub const STOP_COMMAND: &str = "STOP {}\n";
 
 pub const STREAM: &str = "STREAM";
 pub const PING: &str = "PING";
@@ -13,8 +12,8 @@ pub const PONG: &str ="PONG";
 pub const STOP: &str = "STOP";
 
 pub struct Subscribe{
-    address: String,
-    tickers: Vec<String>
+    pub address: String,
+    pub tickers: Vec<String>
 }
 
 impl Subscribe {
@@ -25,14 +24,28 @@ impl Subscribe {
 
 }
 
-pub fn check_command(command: &str) -> Result<Subscribe, CommandError>{
+pub fn check_stop_command(command:&str) -> Result<String, CommandError>{
+    if command.starts_with(STOP){
+        let command_parts: Vec<&str> = command.splitn(2, " ").collect();
+        let address = command_parts[1];
+        match check_address(address){
+            Err(e) => return Err(e),
+            Ok(_) => Ok(address.to_string())
+        }
+    }
+    else{
+        Err(CommandError::InvalidCommand(command.to_string()))
+    }
+}
+
+pub fn check_stream_command(command: &str) -> Result<Subscribe, CommandError>{
     if command.starts_with(STREAM){
         let command_parts: Vec<&str> = command.splitn(3, " ").collect();
         let address = command_parts[1];
         match check_address(address){
             Err(e) => return Err(e),
             _=>{
-                let req_tickers : Vec<&str> = command_parts[2].trim().split(" ").collect();
+                let req_tickers : Vec<&str> = command_parts[2].trim().split(", ").collect();
                 if req_tickers.is_empty() {
                     return Err(CommandError::EmptyTickerList)
                 }
