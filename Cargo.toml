@@ -21,4 +21,4 @@ path = "bins/quote_streamer/main.rs"
 
 [[bin]]
 name = "subscriber"
-path = "bins/subscriber/main.rs" 
+path = "bins/subscriber/main.rs"
