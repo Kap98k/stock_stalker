@@ -1,14 +1,16 @@
 //! Udp сервер котировок TCP/UDP/PING
 use std::net::{TcpListener, TcpStream};
 use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use std::thread;
 use std::collections::HashMap;
-use clap::{Parser, ArgGroup};
+use clap::{ArgGroup, Parser};
+
 use stock_stalker::error::CommandError;
 use stock_stalker::quote::QuoteStream;
-use stock_stalker::{protocol::*, GEN_QUOTE_RANGE_MAX};
+use stock_stalker::{GEN_QUOTE_RANGE_MAX, PING_TIMEOUT_SECONDS, protocol::*};
 
 #[derive(Parser)]
 #[command(
@@ -34,45 +36,60 @@ struct Cli{
     file_path_tickers:String
 }
 
+/// Запись о подписчике: сам поток (под Mutex для Send+Sync) и флаг остановки.
 struct Subscribers{
-    subscriber_host: String,
-    streams: HashMap<String, Arc<Mutex<QuoteStream>>>
+    pub subscriber_host: String,
+    /// Ключ: UDP-адрес → (поток, флаг-остановки)
+    streams: HashMap<String, (Arc<Mutex<QuoteStream>>, Arc<AtomicBool>)>,
 }
 
 impl Subscribers {
-    pub fn add(&mut self, quote_stream: Arc<Mutex<QuoteStream>>){
-        let mut a = String::new();
-        {
-            let mut _qs = quote_stream.lock().unwrap();
-            a = _qs.get_address();
-        }
-        self.streams.insert(a, quote_stream);
+    /// Добавляет стрим: сохраняет и Arc<Mutex<QuoteStream>>, и флаг для остановки.
+    pub fn add(&mut self, qs: Arc<Mutex<QuoteStream>>){
+        let (addr, flag) = {
+            let _qs = qs.lock().unwrap();
+            (_qs.get_address(), _qs.streaming_flag())
+        };
+        self.streams.insert(addr, (qs, flag));
     }
 
+    /// Останавливает стрим по UDP-адресу.
     pub fn remove(&mut self, addr: &str){
-        if let Some(qs) = self.streams.get_mut(addr){
-            {
-                let mut _qs = qs.lock().unwrap();
-                _qs.stop_stream();
-            }
-            self.streams.remove(addr);
+        if let Some((_qs, flag)) = self.streams.get(addr){
+            flag.store(false, Ordering::Relaxed);
         }
+        self.streams.remove(addr);
     }
 
-    pub fn find_by_addr(&self, addr: &str) -> bool{
-        return self.streams.contains_key(addr)
+    /// Останавливает все стримы этого подписчика.
+    pub fn remove_all(&mut self){
+        for (_key, (_qs, flag)) in self.streams.iter(){
+            flag.store(false, Ordering::Relaxed);
+        }
+        self.streams.clear();
     }
+
 }
 
 fn handle_connection(stream: TcpStream, subscribers: Arc<Mutex<Vec<Subscribers>>>) {
-    let mut writer = stream.try_clone().expect("failed to clone stream");
+    let mut writer = stream.try_clone().expect("Ошибка при клонировании потока");
+    stream.set_read_timeout(Some(Duration::from_secs(1))).expect("set_read_timeout failed");
     let mut reader = BufReader::new(stream);
-    
-    let mut line = String ::new(); 
+
+    let mut line = String ::new();
+    let mut last_ping = Instant::now();
     loop{
         line.clear();
         match reader.read_line(&mut line){
-            Ok(0) => {return}
+            Ok(0) => {
+                // Клиент отключился — чистим все его стримы
+                let host = writer.peer_addr().unwrap();
+                let mut s_list = subscribers.lock().unwrap();
+                if let Some(result) = s_list.iter_mut().find(|s| s.subscriber_host == host.to_string()){
+                    result.remove_all();
+                }
+                return;
+            }
             Ok(_)=>{
                 println!("New command {}", line);
                 if line.contains(STOP){
@@ -82,7 +99,7 @@ fn handle_connection(stream: TcpStream, subscribers: Arc<Mutex<Vec<Subscribers>>
                         Ok(addr) => {
                             let mut s_list = subscribers.lock().unwrap();
                             let host = writer.peer_addr().unwrap();
-                            if let Some(result) = s_list.iter_mut().find(|s| s.find_by_addr(&host.to_string())){
+                            if let Some(result) = s_list.iter_mut().find(|s| s.subscriber_host == host.to_string()){
                                 result.remove(&addr.trim());
                                 answer = "Ok\n".to_string();
                             }
@@ -103,31 +120,42 @@ fn handle_connection(stream: TcpStream, subscribers: Arc<Mutex<Vec<Subscribers>>
                     let mut answer = String::new();
                     match check_stream_command(command){
                         Ok(s) => {
-                            //#ISSUE дописать создание вектора подписчиков и запуск UDP сокета для отправки котировок
                             let mut s_list = subscribers.lock().unwrap();
                             let qs = QuoteStream::new(s);
                             match qs {
                                 Ok(qs) =>{
+                                    let qs = Arc::new(Mutex::new(qs));
                                     let host = writer.peer_addr().unwrap();
-                                    if let Some(result) = s_list.iter_mut().find(|s| s.find_by_addr(&host.to_string())){
-                                        let quote_stream = Arc::new(Mutex::new(qs));
-                                        result.add(quote_stream.clone());
-                                        let handle = thread::spawn(move || {
-                                            let mut qs = quote_stream.lock().unwrap();
+                                    if let Some(result) = s_list.iter_mut().find(|s| s.subscriber_host == host.to_string()){
+                                        result.add(qs.clone());
+                                        let _handle = thread::spawn(move || {
+                                            let qs = qs.lock().unwrap();
                                             println!("Запускаем передачу котировок для {}", qs.get_address());
                                             let _ = qs.run_stream(GEN_QUOTE_RANGE_MAX as u64);
                                         });
-                                        answer = "Ok\n".to_string();
                                     }
                                     else{
+                                        let udp_address = {
+                                            let _qs = qs.lock().unwrap();
+                                            _qs.get_address()
+                                        };
+                                        let flag = {
+                                            let _qs = qs.lock().unwrap();
+                                            _qs.streaming_flag()
+                                        };
                                         let mut hs = HashMap::new();
-                                        hs.insert(qs.get_address(), Arc::new(Mutex::new(qs)));
+                                        hs.insert(udp_address, (qs.clone(), flag));
                                         s_list.push(Subscribers{subscriber_host:host.to_string(), streams:hs});
+                                        let _handle = thread::spawn(move || {
+                                            let qs = qs.lock().unwrap();
+                                            println!("Запускаем передачу котировок для {}", qs.get_address());
+                                            let _ = qs.run_stream(GEN_QUOTE_RANGE_MAX as u64);
+                                        });
                                     }
+                                    answer = "Ok\n".to_string();
                                 }
                                 Err(e)=>{
                                     println!("Ошибка при создании стриминга: {}", e);
-                                    //answer = CommandError::InvalidAddress(e.to_string()).to_string();
                                 }
                             }
                         }
@@ -138,8 +166,26 @@ fn handle_connection(stream: TcpStream, subscribers: Arc<Mutex<Vec<Subscribers>>
                     let _ = writer.write_all(answer.as_bytes());
                     let _ = writer.flush();
                 }
+                if line.contains(PING){
+                    let command = line.trim();
+                    if command.starts_with(PING){
+                        println!("Получен PING от клиента {}", &writer.peer_addr().unwrap().to_string());
+                        last_ping = Instant::now();
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                // read timeout — проверим PING ниже
             }
             Err(_) => { return }
+        }
+        if last_ping.elapsed() >= Duration::from_secs(PING_TIMEOUT_SECONDS as u64) {
+            let mut s_list = subscribers.lock().unwrap();
+            let host = writer.peer_addr().unwrap();
+            if let Some(result) = s_list.iter_mut().find(|s| s.subscriber_host == host.to_string()){
+                result.remove_all();
+            }
+            break;
         }
     }
 

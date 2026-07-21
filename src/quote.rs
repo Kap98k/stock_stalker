@@ -25,21 +25,6 @@ use crate::protocol::*;
 /// <TICKER>|<PRICE>|<VOLUME>|<TIMESTAMP>
 /// ```
 ///
-/// ## Пример
-///
-/// ```
-/// use stock_stalker::quote::StockQuote;
-///
-/// let quote = StockQuote::new(
-///     "SBER".to_string(),
-///     350.50,
-///     1000,
-///     1689678900
-/// );
-///
-/// let wire_line = quote.to_wire_line();
-/// assert_eq!(wire_line, "SBER|350.5|1000|1689678900\n");
-/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct StockQuote {
     /// Тикер акции
@@ -79,7 +64,7 @@ impl StockQuote {
     ///
     /// Строка, готовая для отправки по сети
     pub fn to_wire_line(&self) -> String {
-        format!("{}|{}|{}|{}\n", self.ticker, self.price, self.volume, self.timestamp)
+        format!("{}|{}|{}|{}\n", self.ticker, self.price, self.volume, self.timestamp).to_string()
     }
 
     /// Разбирает строку котировки из сети.
@@ -130,6 +115,8 @@ impl StockQuote {
 }
 
 use std::net::UdpSocket;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -140,25 +127,10 @@ use std::time::Duration;
 /// Эта структура инкапсулирует UDP сокет и информацию о подписчике.
 /// Она предоставляет методы для отправки котировок и управления потоком.
 ///
-/// ## Пример
-///
-/// ```no_run
-/// use stock_stalker::quote::{StockQuote, QuoteStream};
-/// use stock_stalker::protocol::Subscribe;
-///
-/// let subscribe = Subscribe::new(
-///     "127.0.0.1:9000".to_string(),
-///     vec!["SBER".to_string()]
-/// );
-///
-/// let mut stream = QuoteStream::new(subscribe).unwrap();
-/// let quote = StockQuote::new("SBER".to_string(), 350.50, 1000, 1689678900);
-/// stream.send(&quote, "127.0.0.1:9000").unwrap();
-/// ```
 pub struct QuoteStream {
     socket: UdpSocket,
     subscriber: Subscribe,
-    streaming: bool
+    streaming: Arc<AtomicBool>,
 }
 
 impl QuoteStream {
@@ -173,8 +145,15 @@ impl QuoteStream {
     /// - `Ok(QuoteStream)` - если сокет успешно привязан
     /// - `Err(std::io::Error)` - если не удалось привязать сокет
     pub fn new(subscriber: Subscribe) -> Result<Self, std::io::Error> {
-        let socket = UdpSocket::bind(&subscriber.address)?;
-        Ok(Self { socket, subscriber, streaming: false })
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        Ok(Self { socket, subscriber, streaming: Arc::new(AtomicBool::new(false)) })
+    }
+
+    /// Возвращает клон атомарного флага `streaming`.
+    ///
+    /// Используется для внешней остановки потока без захвата Mutex.
+    pub fn streaming_flag(&self) -> Arc<AtomicBool> {
+        self.streaming.clone()
     }
 
     /// Возвращает UDP адрес подписчика.
@@ -197,7 +176,7 @@ impl QuoteStream {
     ///
     /// - `Ok(())` - если котировка успешно отправлена
     /// - `Err(Box<dyn std::error::Error>)` - если произошла ошибка при отправке
-    pub fn send(&self, quote: &StockQuote, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn send(&self, quote: &StockQuote, addr: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let buf = quote.to_wire_line();
         self.socket.send_to(&buf.as_bytes(), addr)?;
         Ok(())
@@ -211,29 +190,30 @@ impl QuoteStream {
     ///
     /// ## Возвращает
     ///
-    /// - `Ok(())` - если цикл запущен успешно (в текущей реализации не завершается)
-    /// - `Err(Box<dyn std::error::Error>)` - если произошла ошибка при отправке
+    /// - `Ok(())` — если цикл остановлен через `stop_stream()`
+    /// - `Err(Box<dyn std::error::Error>)` — если произошла ошибка при отправке
     ///
     /// ## Примечание
     ///
-    /// Этот метод запускает бесконечный цикл. Для остановки используйте метод `stop_stream()`.
-    pub fn run_stream(&mut self, interval_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
+    /// Этот метод можно вызывать через `Arc`, блокировка Mutex не требуется.
+    pub fn run_stream(&self, interval_ms: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("Запускаем стрим котировок для {}", &self.subscriber.address);
-        self.streaming = true;
+        self.streaming.store(true, Ordering::Relaxed);
 
         loop {
-            if self.streaming {
-                let quote = Self::random(&self.subscriber.tickers);
-                match self.send(&quote, &self.subscriber.address) {
-                    Ok(()) => {
-                        println!("Отправлена котировка: {}", quote.to_wire_line());
-                    }
-                    Err(e) => {
-                        eprintln!("Ошибка отправки: {}", e);
-                    }
-                }
-                thread::sleep(Duration::from_millis(interval_ms));
+            if !self.streaming.load(Ordering::Relaxed) {
+                return Ok(());
             }
+            let quote = Self::random(&self.subscriber.tickers);
+            match self.send(&quote, &self.subscriber.address) {
+                Ok(()) => {
+                    println!("Отправлена котировка: {}", quote.to_wire_line());
+                }
+                Err(e) => {
+                    eprintln!("Ошибка отправки: {}", e);
+                }
+            }
+            thread::sleep(Duration::from_millis(interval_ms));
         }
     }
 
@@ -265,7 +245,7 @@ impl QuoteStream {
         use std::time::{SystemTime, UNIX_EPOCH};
         let mut rng = ThreadRng::default();
         StockQuote::new(
-            tickers[rng.random_range(0..tickers.len() - 1)].clone(),
+            tickers[rng.random_range(0..tickers.len())].clone(),
             rng.random_range(100.0..5000.0),
             rng.random_range(10..1000),
             SystemTime::now()
@@ -277,12 +257,10 @@ impl QuoteStream {
 
     /// Останавливает поток котировок.
     ///
-    /// Устанавливает флаг `streaming` в `false`, что приводит к остановке цикла
-    /// в методе `run_stream()`.
-    pub fn stop_stream(&mut self) {
-        if self.streaming {
-            self.streaming = false;
-        }
+    /// Устанавливает атомарный флаг `streaming` в `false`, что приводит
+    /// к выходу из `run_stream()`. Потокобезопасен, не требует Mutex.
+    pub fn stop_stream(&self) {
+        self.streaming.store(false, Ordering::Relaxed);
     }
 }
 
@@ -395,11 +373,97 @@ mod tests {
         drop(socket);
 
         let subscribe = Subscribe::new(addr.clone(), vec!["SBER".to_string()]);
-        let mut stream = QuoteStream::new(subscribe).unwrap();
-        assert!(!stream.streaming);
+        let stream = QuoteStream::new(subscribe).unwrap();
+        assert!(!stream.streaming.load(Ordering::Relaxed));
         
         stream.stop_stream();
-        assert!(!stream.streaming);
+        assert!(!stream.streaming.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_send_delivers_datagram() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap().to_string();
+        rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        let subscribe = Subscribe::new(rx_addr.clone(), vec!["SBER".to_string()]);
+        let stream = QuoteStream::new(subscribe).unwrap();
+        let quote = StockQuote::new("SBER".to_string(), 100.0, 10, 1);
+
+        stream.send(&quote, &rx_addr).unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = rx.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], quote.to_wire_line().as_bytes());
+    }
+
+    #[test]
+    fn test_streaming_flag_shared() {
+        let subscribe = Subscribe::new("127.0.0.1:9999".to_string(), vec!["SBER".to_string()]);
+        let stream = QuoteStream::new(subscribe).unwrap();
+        let flag = stream.streaming_flag();
+
+        flag.store(true, Ordering::Relaxed);
+        assert!(stream.streaming.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_run_stream_stops_on_flag() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = rx.local_addr().unwrap().to_string();
+        drop(rx);
+
+        let subscribe = Subscribe::new(addr, vec!["SBER".to_string()]);
+        let stream = Arc::new(QuoteStream::new(subscribe).unwrap());
+        let s = stream.clone();
+
+        let handle = thread::spawn(move || s.run_stream(10));
+        thread::sleep(Duration::from_millis(50));
+        stream.stop_stream();
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_stream_starts_flag() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = rx.local_addr().unwrap().to_string();
+        drop(rx);
+
+        let subscribe = Subscribe::new(addr, vec!["SBER".to_string()]);
+        let stream = Arc::new(QuoteStream::new(subscribe).unwrap());
+        assert!(!stream.streaming.load(Ordering::Relaxed));
+
+        let s = stream.clone();
+        let handle = thread::spawn(move || s.run_stream(10));
+        thread::sleep(Duration::from_millis(30));
+        assert!(stream.streaming.load(Ordering::Relaxed));
+
+        stream.stop_stream();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_send_to_wrong_address_does_not_panic() {
+        let subscribe = Subscribe::new("127.0.0.1:9998".to_string(), vec!["SBER".to_string()]);
+        let stream = QuoteStream::new(subscribe).unwrap();
+        let quote = StockQuote::new("SBER".to_string(), 100.0, 10, 1);
+
+        // Отправка на несуществующий адрес — UDP не гарантирует доставку, но не паникует
+        let result = stream.send(&quote, "127.0.0.1:19999");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_quote_stream_multiple_stops_idempotent() {
+        let subscribe = Subscribe::new("127.0.0.1:9997".to_string(), vec!["SBER".to_string()]);
+        let stream = QuoteStream::new(subscribe).unwrap();
+
+        stream.stop_stream();
+        stream.stop_stream();
+        stream.stop_stream();
+        assert!(!stream.streaming.load(Ordering::Relaxed));
     }
 
     #[cfg(feature = "random")]

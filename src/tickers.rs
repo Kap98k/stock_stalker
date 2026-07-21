@@ -71,3 +71,74 @@ pub fn check_tickers(req_tickers: Vec<&str>) -> Result<Vec<String>, CommandError
     }
     Ok(tickers)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Глобальный мьютекс для сериализации тестов, работающих с TICKERS_LIST.
+    static TICKERS_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Перезаписывает глобальный TICKERS_LIST на время теста.
+    fn with_tickers<F: FnOnce()>(tickers: &[&str], test: F) {
+        let _guard = TICKERS_TEST_MUTEX.lock().unwrap();
+
+        let old: Vec<String> = TICKERS_LIST.read().unwrap().iter().cloned().collect();
+        {
+            let mut list = TICKERS_LIST.write().unwrap();
+            list.clear();
+            for t in tickers {
+                list.insert(t.to_string());
+            }
+        }
+
+        test();
+
+        {
+            let mut list = TICKERS_LIST.write().unwrap();
+            list.clear();
+            for t in old {
+                list.insert(t);
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_tickers_all_found() {
+        with_tickers(&["SBER", "GAZP", "LKOH"], || {
+            let result = check_tickers(vec!["SBER", "GAZP"]);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), vec!["SBER", "GAZP"]);
+        });
+    }
+
+    #[test]
+    fn test_check_tickers_not_found() {
+        with_tickers(&["SBER"], || {
+            let result = check_tickers(vec!["MISSING"]);
+            assert!(result.is_err());
+            match result {
+                Err(CommandError::TickerNotFound(t)) => assert_eq!(t, "MISSING"),
+                _ => panic!("expected TickerNotFound"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_check_tickers_empty_input() {
+        with_tickers(&["SBER"], || {
+            let result = check_tickers(vec![]);
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_check_tickers_trims_whitespace() {
+        with_tickers(&["SBER"], || {
+            let result = check_tickers(vec!["  SBER  "]);
+            assert!(result.is_err());
+        });
+    }
+}

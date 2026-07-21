@@ -98,3 +98,112 @@ impl fmt::Display for CommandError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CommandError ─────────────────────────────────────────
+
+    #[test]
+    fn test_command_error_to_string_ticker_not_found() {
+        let e = CommandError::TickerNotFound("SBER".to_string());
+        assert_eq!(e.to_string(), "ERR unknown ticker: SBER\n");
+    }
+
+    #[test]
+    fn test_command_error_to_string_invalid_command() {
+        let e = CommandError::InvalidCommand("bad".to_string());
+        assert_eq!(e.to_string(), "ERR invalid command\n");
+    }
+
+    #[test]
+    fn test_command_error_to_string_empty_ticker_list() {
+        let e = CommandError::EmptyTickerList;
+        assert_eq!(e.to_string(), "ERR empty ticker list\n");
+    }
+
+    #[test]
+    fn test_command_error_to_string_invalid_address() {
+        let e = CommandError::InvalidAddress("x".to_string());
+        assert_eq!(e.to_string(), "ERR invalid udp address\n");
+    }
+
+    #[test]
+    fn test_command_error_to_string_address_not_found() {
+        let e = CommandError::AddressNotFound("x".to_string());
+        assert_eq!(e.to_string(), "ERR udp address not found\n");
+    }
+
+    #[test]
+    fn test_command_error_display() {
+        let e = CommandError::EmptyTickerList;
+        assert_eq!(format!("{}", e), "Пустой список котировок!");
+    }
+
+    // ── QuoteError ───────────────────────────────────────────
+
+    #[test]
+    fn test_quote_error_display_ticker_not_found() {
+        let e = QuoteError::TickerNotFound("SBER".to_string());
+        assert_eq!(format!("{}", e), "Запрашиваемый тикер SBER не найден!");
+    }
+
+    #[test]
+    fn test_quote_error_display_invalid_format() {
+        let e = QuoteError::InvalidFormat("bad".to_string());
+        assert_eq!(format!("{}", e), "Неверный формат котировки: bad");
+    }
+
+    #[test]
+    fn test_quote_error_display_invalid_quote() {
+        let e = QuoteError::InvalidQuote("has space".to_string());
+        assert_eq!(format!("{}", e), "Неверная котировка: has space");
+    }
+
+    #[test]
+    fn test_quote_error_display_some_quotes() {
+        let e = QuoteError::SomeQuotes();
+        assert_eq!(format!("{}", e), "Несколько котировок в одной строке недопустимо!");
+    }
+
+    #[test]
+    fn test_quote_error_display_parse_error() {
+        let inner = "invalid float literal".parse::<f64>().unwrap_err();
+        let e = QuoteError::ParseError(ParsedFieldError {
+            value: "abc".to_string(),
+            index: 1,
+            reason: Box::new(inner),
+        });
+        let displayed = format!("{}", e);
+        assert!(displayed.contains("Ошибка '"));
+        assert!(displayed.contains("при разборе поля 'abc' с индексом '1'"));
+    }
+
+    #[test]
+    fn test_quote_error_debug() {
+        let e = QuoteError::InvalidFormat("x".to_string());
+        let dbg = format!("{:?}", e);
+        assert!(dbg.contains("InvalidFormat"));
+    }
+
+    #[test]
+    fn test_command_error_debug() {
+        let e = CommandError::InvalidCommand("x".to_string());
+        let dbg = format!("{:?}", e);
+        assert!(dbg.contains("InvalidCommand"));
+    }
+
+    #[test]
+    fn test_parsed_field_error_debug() {
+        let inner = "invalid float literal".parse::<f64>().unwrap_err();
+        let e = ParsedFieldError {
+            value: "abc".to_string(),
+            index: 2,
+            reason: Box::new(inner),
+        };
+        let dbg = format!("{:?}", e);
+        assert!(dbg.contains("abc"));
+        assert!(dbg.contains("2"));
+    }
+}

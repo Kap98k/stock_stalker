@@ -1,9 +1,12 @@
 //! Клиент получающий данные с сервера котировок
 use clap::Parser;
-use stock_stalker::protocol::{PING, STOP};
+use stock_stalker::protocol::STOP;
 use stock_stalker::quote::StockQuote;
+use stock_stalker::PING_INTERVAL_SECONDS;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -28,7 +31,7 @@ fn main() {
     let args = Args::parse();
 
     println!("Подключение к серверу {}", args.tcp_server);
-    
+
     // Подключаемся к TCP серверу
     let mut tcp_stream = match connect_to_server(&args.tcp_server) {
         Ok(stream) => stream,
@@ -60,8 +63,20 @@ fn main() {
             receive_quotes(&udp_address, &ticker_list);
         });
 
-        // Основной поток обрабатывает PING и STOP команды
-        handle_commands(tcp_stream);
+        // Запускаем фоновую отправку PING каждые PING_INTERVAL_SECONDS
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+        let mut tcp_ping = tcp_stream.try_clone().expect("failed to clone stream");
+        let ping_handle = thread::spawn(move || {
+            while r.load(Ordering::Relaxed) {
+                let _ = send_command(&mut tcp_ping, "PING\n");
+                thread::sleep(Duration::from_secs(PING_INTERVAL_SECONDS as u64));
+            }
+        });
+
+        // Основной поток обрабатывает STOP и exit
+        handle_commands(tcp_stream, running, &args.udp_address);
+        let _ = ping_handle.join();
     } else {
         eprintln!("Ошибка при оформлении подписки: {}", response);
     }
@@ -142,10 +157,9 @@ fn receive_quotes(udp_address: &str, ticker_list: &str) {
     }
 }
 
-fn handle_commands(mut tcp_stream: TcpStream) {
+fn handle_commands(mut tcp_stream: TcpStream, running: Arc<AtomicBool>, udp_address: &str) {
     println!("\nДоступные команды:");
-    println!("  ping    - проверить состояние соединения");
-    println!("  stop    - остановить поток котировок");
+    println!("  stop    - остановить поток котировок и выйти");
     println!("  exit    - выйти из клиента");
     println!();
 
@@ -160,30 +174,24 @@ fn handle_commands(mut tcp_stream: TcpStream) {
             Ok(_) => {
                 let command = input.trim();
                 match command {
-                    "ping" => {
-                        if let Err(e) = send_command(&mut tcp_stream, format!("{} 1\n", PING).as_str()) {
-                            eprintln!("Ошибка отправки PING: {}", e);
-                        } else {
-                            let response = read_response(&mut tcp_stream);
-                            println!("PING response: {}", response);
-                        }
-                    }
                     "stop" => {
-                        if let Err(e) = send_command(&mut tcp_stream, format!("{} 1\n", STOP).as_str()) {
+                        running.store(false, Ordering::Relaxed);
+                        let stop_cmd = format!("STOP {}\n", udp_address);
+                        if let Err(e) = send_command(&mut tcp_stream, &stop_cmd) {
                             eprintln!("Ошибка отправки STOP: {}", e);
-                        } else {
-                            let response = read_response(&mut tcp_stream);
-                            println!("STOP response: {}", response);
-                            println!("Выход...");
-                            break;
                         }
+                        let response = read_response(&mut tcp_stream);
+                        println!("STOP response: {}", response);
+                        println!("Выход...");
+                        break;
                     }
                     "exit" => {
+                        running.store(false, Ordering::Relaxed);
                         println!("Выход...");
                         break;
                     }
                     _ => {
-                        println!("Неизвестная команда. Используйте: ping, stop, exit");
+                        println!("Неизвестная команда. Используйте: stop, exit");
                     }
                 }
             }
